@@ -5,13 +5,22 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import Anthropic from '@anthropic-ai/sdk';
-import { processPDFFile, cleanExtractedText } from '@/lib/pdf-utils';
 import { reconcileInvoiceData, generateReconciliationSummary, validateInvoiceData, validatePORecords } from '../../../../reconciliation';
 import { InvoiceData, PurchaseOrderRecord, ReconciliationResult, ReconciliationSummary } from '../../../../types';
+import { Buffer } from 'node:buffer';
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
+
+/**
+ * Convert a File (from form-data) into a Base64 string that can be passed to
+ * Anthropic's Messages API.
+ */
+async function fileToBase64(file: File): Promise<string> {
+  const arrayBuffer = await file.arrayBuffer();
+  return Buffer.from(arrayBuffer).toString('base64');
+}
 
 export async function POST(request: NextRequest) {
   try {
@@ -32,46 +41,48 @@ export async function POST(request: NextRequest) {
       }, { status: 400 });
     }
     
-    // Step 1: Extract text from PDF
-    const pdfResult = await processPDFFile(file);
-    const extractedText = cleanExtractedText(pdfResult.text);
-    
-    if (!extractedText || extractedText.trim().length === 0) {
-      return NextResponse.json({
-        success: false,
-        error: 'No text found in PDF file'
-      }, { status: 400 });
-    }
-    
-    // Step 2: Use Claude to extract invoice data
+    // Step 1: Encode the PDF and ask Claude to extract invoice data directly
+    const pdfBase64 = await fileToBase64(file);
+
     const message = await anthropic.messages.create({
       model: "claude-sonnet-4-20250514",
       max_tokens: 2048,
       messages: [
         {
           role: "user",
-          content: `From the extracted invoice text, extract the following information and return as JSON:
+          content: [
+            {
+              type: "document",
+              source: {
+                type: "base64",
+                media_type: "application/pdf",
+                data: pdfBase64
+              }
+            },
+            {
+              type: "text",
+              text: `Extract the following information from this invoice PDF **and return *only* JSON**:
 {
-    "poNumber": "The purchase order number",
-    "invoiceDate": "Invoice date if available at document level",
-    "lineItems": [
-        {
-            "productName": "Product name/description",
-            "quantity": "Quantity as number",
-            "unitPrice": "Unit price per item as number (if available)",
-            "totalPrice": "Total line price as number (if available)",
-            "deliveryDate": "Delivery date for this specific item if listed under the item, otherwise leave empty"
-        }
-    ]
+  "poNumber": "The purchase order number",
+  "invoiceDate": "Invoice date (if present)",
+  "lineItems": [
+    {
+      "productName": "Product description",
+      "quantity": "Number",
+      "unitPrice": "Unit price as number (if available)",
+      "totalPrice": "Line total as number (if available)",
+      "deliveryDate": "Delivery date for the item or empty string"
+    }
+  ]
 }
 
-Extract ALL line items from the invoice. Make sure quantities and prices are numbers, not strings.
-For productName, extract the full product description as it appears.
-For unitPrice and totalPrice: Look for both unit price per item AND total line price. If only one is available, extract that one. If both are available, extract both.
-For deliveryDate, look for any date information that appears under or near each individual line item (like delivery dates, required dates, etc.). If there's no item-specific date, leave this field empty.
-
-Here's the extracted text:
-${extractedText}`
+Rules:
+• Extract *all* line items.
+• Quantities & prices must be numbers, not strings.
+• If a field is missing leave it blank ("" or 0) but keep the key.
+• Return **nothing except the JSON object**.`
+            }
+          ]
         }
       ]
     });
@@ -139,7 +150,6 @@ ${extractedText}`
     return NextResponse.json({
       success: true,
       data: {
-        extractedText: extractedText.substring(0, 500) + '...', // Truncate for response size
         invoiceData,
         purchaseOrderCount: purchaseOrders.length,
         reconciliationResults,
