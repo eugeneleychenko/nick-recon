@@ -18,28 +18,24 @@ export async function extractTextFromPDF(
     const pdfjsLib = await import('pdfjs-dist');
     
     // Configure worker for PDF.js
-    if (typeof window !== 'undefined') {
-      // Browser environment - use CDN worker
+    const isBrowser = typeof window !== 'undefined';
+
+    if (isBrowser) {
+      // Browser environment – use a CDN-hosted worker so that the worker file is always available
       pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/4.9.155/pdf.worker.min.mjs`;
-    } else {
-      // Server environment - use local worker path or disable completely
-      try {
-        // Try to use the bundled worker
-        pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-          'pdfjs-dist/build/pdf.worker.min.mjs',
-          import.meta.url
-        ).toString();
-      } catch {
-        // Fallback: disable worker entirely for server-side rendering
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (pdfjsLib.GlobalWorkerOptions as any).workerSrc = null;
-      }
     }
+
+    // NOTE: When running in a server / edge function (e.g. Vercel), spawning a Web Worker is either
+    // impossible or unnecessary and setting `workerSrc` to `null` triggers the
+    // "Invalid workerSrc type" error you saw in production. Instead, we disable the worker entirely
+    // via the `disableWorker` option at load time (see below).
     
     // Load the PDF document
     const loadingTask = pdfjsLib.getDocument({
       data: new Uint8Array(buffer),
       verbosity: 0, // Reduce logging
+      // On the server (Node.js / edge runtimes) we must disable workers to avoid workerSrc errors
+      ...(isBrowser ? {} : { disableWorker: true }),
     });
     
     const pdfDocument = await loadingTask.promise;
